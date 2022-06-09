@@ -29,6 +29,8 @@ class InstanceTracker(object):
         
         # 历史有效的特征
         self.exist_feature_vetors = None
+        # 历史有效的坐标
+        self.exist_boxes_cxcy = None
         # 追踪框生命计数, <=0 时将被移除
         self.tracker_life = []
         # 每一个框的追踪id
@@ -37,26 +39,36 @@ class InstanceTracker(object):
         self.momentum = momentum
         # 追踪计数变量
         self.cur_trace_id = 1
-        
+  
     def __call__(self, image, bboxes, scores, class_ids):
+        if len(bboxes) == 0 and self.exist_feature_vetors is None:
+            # 初始化不成功
+            return []
+        
+        cxcy = self.get_cxcy(bboxes)
         # 抽特征
         features = self.get_features(image, bboxes)
         if self.exist_feature_vetors is None:
             # 初始化
             self.exist_feature_vetors = features
+            self.exist_boxes_cxcy = cxcy
             self.tracker_life = np.array([self.max_age]*len(features))
             self.trace_ids = np.array([i for i in range(len(features))])
             self.cur_trace_id = len(self.trace_ids)
         
-        # 计算相似度分数
-        similarity_scores = self.compute_similarity(features, self.exist_feature_vetors)
-        # print(similarity_scores)
-
-        # 进行配对
-        pair_list = self.get_match_pair(similarity_scores)
-
+        pair_list = [-1]*len(self.exist_feature_vetors)
+        if len(features) > 0:
+            # 计算特征相似度分数
+            similarity_scores = self.compute_similarity(features, self.exist_feature_vetors)
+            # 计算距离分数
+            distance_scores = self.compute_similarity(cxcy, self.exist_boxes_cxcy)
+            final_score = similarity_scores*distance_scores
+            
+            # 进行配对
+            pair_list = self.get_match_pair(final_score)
+            
         # 更新tracker状态
-        _pair_list = self.update_tracker_state(pair_list, features)
+        _pair_list = self.update_tracker_state(pair_list, features, cxcy)
 
         # 分配追踪id号
         instance_ids = [-1]*len(bboxes)
@@ -65,6 +77,16 @@ class InstanceTracker(object):
         outputs = np.hstack([bboxes, instance_ids[:, np.newaxis], 
                             class_ids[:, np.newaxis], scores[:, np.newaxis]])
         return outputs
+
+    def get_cxcy(self, x1y1x2y2):
+        '''
+        得到中心点坐标
+        :param x1y1x2y2: ndnarray
+        '''
+        cxcy = np.zeros((len(x1y1x2y2), 2), dtype=x1y1x2y2.dtype)
+        cxcy[:, 0] = x1y1x2y2[:, 2] - x1y1x2y2[:, 0]
+        cxcy[:, 1] = x1y1x2y2[:, 3] - x1y1x2y2[:, 1]
+        return cxcy
 
     def assign_instance_id(self, match_pair, instance_ids):
         '''
@@ -78,11 +100,12 @@ class InstanceTracker(object):
             instance_ids[match_pair[i]] = self.trace_ids[i]
         return np.array(instance_ids, dtype=np.int32)
 
-    def update_tracker_state(self, match_pair, features):
+    def update_tracker_state(self, match_pair, features, cxcy):
         '''
         更新追踪器状态
         :param match_pair: list, b2a信息
         :param features: 2D matrix, 特征矩阵
+        :param cxcy: (N, 2), 中心点坐标
         '''
         match_pair = np.array(match_pair, dtype=np.int32)
         # 修正tracker生命周期
@@ -99,9 +122,11 @@ class InstanceTracker(object):
                 active_indexes.append(i)
                 # 修正feature, 动量更新
                 self.exist_feature_vetors[i] = self.momentum*self.exist_feature_vetors[i] + (1-self.momentum)*features[match_pair[i]]
+                self.exist_boxes_cxcy[i] = cxcy[match_pair[i]]
 
         # 去除不活跃的历史tracker
         self.exist_feature_vetors = self.exist_feature_vetors[active_indexes]
+        self.exist_boxes_cxcy = self.exist_boxes_cxcy[active_indexes]
         self.tracker_life = self.tracker_life[active_indexes]
         self.trace_ids = self.trace_ids[active_indexes]
         match_pair = match_pair[active_indexes]
@@ -113,6 +138,7 @@ class InstanceTracker(object):
                 continue
             match_pair = np.hstack([match_pair, i])
             self.exist_feature_vetors = np.vstack([self.exist_feature_vetors, [features[i]]])
+            self.exist_boxes_cxcy = np.vstack([self.exist_boxes_cxcy, [cxcy[i]]])
             self.tracker_life = np.hstack([self.tracker_life, self.max_age])
             self.trace_ids = np.hstack([self.trace_ids, self.cur_trace_id])
             self.cur_trace_id = (self.cur_trace_id + 1)%self.max_id
@@ -162,6 +188,18 @@ class InstanceTracker(object):
         Y = np.dot(A, B.T) \
             / np.dot(np.linalg.norm(A, axis=1, keepdims=True), 
                       np.linalg.norm(B, axis=1, keepdims=True).T)
+        return Y
+
+    def compute_distance(self, A, B):
+        '''
+        计算欧式距离
+        :param Matrix A (N1, 2)
+        :param Matrix B (N2, 2)
+        :return Matrix Y (N1, N2)
+        '''
+        Y = np.zeros((A.shape[0], B.shape[0]), dtype=np.float32)
+        for i in range(A.shape[0]):
+            Y[i] = np.sqrt(np.sum(np.power(A[i] - B, 2), axis=-1))
         return Y
 
     def get_features(self, ori_img, bboxes):
